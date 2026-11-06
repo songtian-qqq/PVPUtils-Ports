@@ -1,0 +1,44 @@
+package com.pvp_utils.mixin.client;
+
+import com.pvp_utils.Config;
+import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
+import org.spongepowered.asm.mixin.injection.ModifyArgs;
+import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+
+@Mixin(targets = "net.minecraft.client.renderer.entity.FishingHookRenderer")
+public abstract class FishingHookRendererMixin {
+    @ModifyArgs(
+            method = "getPlayerHandPos",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/client/Camera$NearPlane;getPointOnPlane(FF)Lnet/minecraft/world/phys/Vec3;"
+            )
+    )
+    private void pvp_utils$legacy17LineStart(Args args) {
+        if (Config.legacy17Animations && Config.legacy17FishingRod) {
+            args.set(1, ((float) args.get(1)) + 0.15F);
+        }
+    }
+
+    @ModifyExpressionValue(
+            method = "getPlayerHandPos",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/world/entity/player/Player;isCrouching()Z"
+            )
+    )
+    private boolean pvp_utils$legacy17LineCrouch(boolean original) {
+        return Config.legacy17Animations && Config.legacy17FishingRod ? false : original;
+    }
+
+    @ModifyExpressionValue(
+            method = "getPlayerHandPos",
+            at = @At(value = "CONSTANT", args = "doubleValue=0.8")
+    )
+    private double pvp_utils$legacy17LinePosition(double original) {
+        return Config.legacy17Animations && Config.legacy17FishingRod ? original + 0.05D : original;
+    }
+
+    }
