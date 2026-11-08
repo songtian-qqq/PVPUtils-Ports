@@ -1,0 +1,978 @@
+package com.pvp_utils.client.alt;
+
+import io.github.humbleui.types.RRect;
+
+import com.pvp_utils.client.render.skia.SkijaUi;
+
+import com.pvp_utils.client.render.MainUI.MainUISharedBackground;
+import com.pvp_utils.client.render.MainUI.MainUIFlipAnimation;
+import com.pvp_utils.client.render.MainUI.MainUiScale;
+import com.pvp_utils.client.render.skia.SkijaRenderer;
+import io.github.humbleui.skija.Canvas;
+import io.github.humbleui.skija.Image;
+import io.github.humbleui.skija.Matrix33;
+import io.github.humbleui.skija.Paint;
+import io.github.humbleui.skija.PaintMode;
+import io.github.humbleui.skija.SamplingMode;
+import io.github.humbleui.types.Rect;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.CharacterEvent;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+import net.minecraft.network.chat.Component;
+import net.minecraft.sounds.SoundEvents;
+
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+
+public final class AltManagerScreen extends Screen implements com.pvp_utils.client.render.skia.SkijaScreen {
+    private static final long OPEN_MS = 440L;
+    private static final long CLOSE_MS = 440L;
+    private final Screen parent;
+    private final String shaderPath;
+    private final Runnable embeddedBack;
+    private final List<Float> accountHover = new ArrayList<>();
+    private final List<Float> accountSelection = new ArrayList<>();
+    private final Map<UUID, Image> accountAvatars = new HashMap<>();
+    private final Map<UUID, CompletableFuture<byte[]>> pendingAvatars = new HashMap<>();
+    private Image offlineAvatar;
+    private AltManager.Account selected;
+    private AltManager.Account deleteTarget;
+    private String input = "";
+    private String status = "";
+    private String deviceCode = "";
+    private String microsoftStatus = "Preparing Microsoft login...";
+    private int microsoftStatusColor = 0xFFFFFFFF;
+    private long deviceExpiresAt;
+    private long deviceCodeCopiedAt;
+    private long microsoftSuccessAt;
+    private long statusExpiresAt;
+    private long lastAccountClickMs;
+    private int lastAccountClick = -1;
+    private boolean offlineOpen;
+    private boolean microsoftWaiting;
+    private boolean deleteConfirmOpen;
+    private boolean closingToMain;
+    private boolean backDispatched;
+    private boolean pendingFrame;
+    private int mouseX;
+    private int mouseY;
+    private float scroll;
+    private float targetScroll;
+    private long openStartMs;
+    private long closeStartMs;
+    private float offlineDialogProgress;
+    private float microsoftDialogProgress;
+    private float deleteDialogProgress;
+
+    public AltManagerScreen(Screen parent) {
+        this(parent, MainUISharedBackground.activeShaderPath(), null);
+    }
+
+    public AltManagerScreen(Screen parent, String shaderPath, Runnable embeddedBack) {
+        super(Component.literal("Alt Manager"));
+        this.parent = parent;
+        this.shaderPath = shaderPath;
+        this.embeddedBack = embeddedBack;
+    }
+
+    public void initEmbedded(Minecraft client, int width, int height) {
+        init(width, height);
+    }
+
+    @Override
+    protected void init() {
+        AltManager.init();
+        openStartMs = System.currentTimeMillis();
+        closeStartMs = 0L;
+        closingToMain = false;
+        backDispatched = false;
+        offlineOpen = false;
+        microsoftWaiting = false;
+        input = "";
+        status = "";
+        deviceCode = "";
+        microsoftStatus = "Preparing Microsoft login...";
+        microsoftStatusColor = 0xFFFFFFFF;
+        deviceCodeCopiedAt = 0L;
+        microsoftSuccessAt = 0L;
+        statusExpiresAt = 0L;
+        lastAccountClickMs = 0L;
+        lastAccountClick = -1;
+        deleteTarget = null;
+        deleteConfirmOpen = false;
+        offlineDialogProgress = 0f;
+        microsoftDialogProgress = 0f;
+        deleteDialogProgress = 0f;
+        scroll = 0f;
+        targetScroll = 0f;
+        selected = currentAccount();
+        syncAccountHover();
+    }
+
+    @Override
+    public void tick() {
+        super.tick();
+        if (microsoftWaiting && deviceExpiresAt > 0L && System.currentTimeMillis() >= deviceExpiresAt) {
+            deviceExpiresAt = 0L;
+            microsoftStatus = "Microsoft login expired.";
+            microsoftStatusColor = 0xFFFF7777;
+        }
+        if (microsoftWaiting && microsoftSuccessAt > 0L && System.currentTimeMillis() - microsoftSuccessAt >= 1800L) {
+            microsoftWaiting = false;
+            microsoftSuccessAt = 0L;
+        }
+        if (!status.isBlank() && statusExpiresAt > 0L && System.currentTimeMillis() >= statusExpiresAt) {
+            status = "";
+            statusExpiresAt = 0L;
+        }
+    }
+
+    @Override
+    protected void repositionElements() {
+        clampScroll();
+    }
+
+    @Override
+    public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+        if (embeddedBack == null && minecraft.gui.screen() == this) {
+            MainUISharedBackground.extractRenderState(graphics, mouseX, mouseY);
+        }
+        scroll += (targetScroll - scroll) * 0.20f;
+        offlineDialogProgress = animate(offlineDialogProgress, offlineOpen ? 1f : 0f);
+        microsoftDialogProgress = animate(microsoftDialogProgress, microsoftWaiting ? 1f : 0f);
+        deleteDialogProgress = animate(deleteDialogProgress, deleteConfirmOpen ? 1f : 0f);
+        float inputScale = inputScale();
+        this.mouseX = MainUiScale.pageX(mouseX, width, inputScale, layoutCenterX());
+        this.mouseY = MainUiScale.pageY(mouseY, height, inputScale, layoutCenterY());
+        if (!deleteConfirmOpen && deleteDialogProgress < .01f) deleteTarget = null;
+        pendingFrame = true;
+        if (closingToMain && closeProgress() >= 1f && minecraft != null && !backDispatched) {
+            backDispatched = true;
+            if (embeddedBack != null && minecraft.gui.screen() != this) {
+                embeddedBack.run();
+            } else {
+                minecraft.gui.setScreen(parent);
+            }
+        }
+    }
+
+    @Override
+    public void extractBackground(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+    }
+
+    @Override
+    public void renderSkija(Canvas canvas) {
+        if (!pendingFrame || minecraft == null || (embeddedBack == null && minecraft.gui.screen() != this)) {
+            pendingFrame = false;
+            return;
+        }
+        try {
+            drawPage(canvas, false);
+        } finally {
+            pendingFrame = false;
+        }
+    }
+
+    public void renderTransition(Matrix33 cardTransform, RRect cardBounds, float chromeAlpha) {
+        if (!pendingFrame || minecraft == null || (embeddedBack == null && minecraft.gui.screen() != this)) {
+            pendingFrame = false;
+            return;
+        }
+        try {
+            SkijaRenderer.draw(canvas -> MainUIFlipAnimation.drawPage(canvas, cardTransform, cardBounds,
+                    chromeAlpha, target -> drawPage(target, true)));
+        } finally {
+            pendingFrame = false;
+        }
+    }
+
+    public void finishTransition() {
+        openStartMs = System.currentTimeMillis() - OPEN_MS;
+    }
+
+    public RRect transitionBounds() {
+        float scale = layoutScale();
+        return RRect.makeXYWH(
+                MainUiScale.pageScreenX(cardX(), width, scale, layoutCenterX()),
+                MainUiScale.pageScreenY(cardY(), height, scale, layoutCenterY()),
+                MainUiScale.pageScreenSize(cardW(), scale),
+                MainUiScale.pageScreenSize(cardH(), scale),
+                MainUiScale.pageScreenSize(20f, scale));
+    }
+
+    private void drawPage(Canvas canvas, boolean transitioning) {
+        if (!closingToMain) {
+            RRect bounds = transitionBounds();
+            SkijaRenderer.drawBlurredBackdrop(canvas, bounds, bounds.getLeft(), bounds.getTop(),
+                    bounds.getWidth(), bounds.getHeight(), 0.95f * 10.5f);
+            SkijaUi.rounded(canvas, bounds.getLeft(), bounds.getTop(), bounds.getWidth(), bounds.getHeight(),
+                    20f * layoutScale(), 0x12000000);
+        }
+        int save = canvas.save();
+        try {
+            MainUiScale.applyPage(canvas, width, height, layoutScale(), layoutCenterX(), layoutCenterY());
+            draw(canvas, transitioning);
+        } finally {
+            canvas.restoreToCount(save);
+        }
+        drawDialogs(canvas);
+    }
+
+    private void draw(Canvas canvas, boolean transitioning) {
+        float contentAlpha = transitioning ? 1f : closingToMain ? 1f - ease(closeProgress()) : ease(openProgress());
+        int alpha = Math.round(255f * contentAlpha);
+        float x = cardX();
+        float y = cardY();
+        float w = cardW();
+        float h = cardH();
+        drawMainCard(canvas, x, y, w, h);
+        String title = "Alt Manager";
+        float pageW = layoutWidth();
+        SkijaUi.text(canvas, title, pageW * .5f - SkijaUi.textWidth(title, 30f) * .5f, (titleY()) + SkijaUi.textMetrics(30f).getAscent(), SkijaUi.textMetrics(30f).getDescent() - SkijaUi.textMetrics(30f).getAscent(), (alpha << 24) | 0xFFFFFF, 30f);
+        drawAccounts(canvas, x + 16f, y + 16f, w - 32f, h - 82f, alpha);
+        if (!status.isBlank()) {
+            drawCentered(canvas, status, pageW * .5f, y + h - 40f, 10f, (Math.round(alpha * .62f) << 24) | 0xFFFFFF);
+        }
+        drawCentered(canvas, currentLoginText(), pageW * .5f, y + h - 20f, 11f,
+        (Math.round(alpha * .82f) << 24) | 0xFFFFFF);
+        float buttonY = y + h + 12f;
+        float buttonW = (w - 32f) / 5f;
+        drawButton(canvas, bottomButtonX(x, buttonW, 0), buttonY, buttonW, 32f, "Login", alpha);
+        drawButton(canvas, bottomButtonX(x, buttonW, 1), buttonY, buttonW, 32f, "Delete", alpha,
+        selected == null || !selected.isCurrent());
+        drawButton(canvas, bottomButtonX(x, buttonW, 2), buttonY, buttonW, 32f, "Add", alpha);
+        drawButton(canvas, bottomButtonX(x, buttonW, 3), buttonY, buttonW, 32f, "Offline", alpha);
+        drawButton(canvas, bottomButtonX(x, buttonW, 4), buttonY, buttonW, 32f, "Back", alpha);
+    }
+
+    private void drawDialogs(Canvas canvas) {
+        float modalProgress = Math.max(offlineDialogProgress, Math.max(microsoftDialogProgress, deleteDialogProgress));
+        if (modalProgress > .01f) {
+            int tintAlpha = Math.round(0x26 * ease(modalProgress));
+            SkijaRenderer.drawBlurredBackdrop(canvas, RRect.makeXYWH(0f, 0f, width, height, 0f),
+                    0f, 0f, width, height, (0.45f + 0.50f * ease(modalProgress)) * 10.5f);
+            SkijaUi.rounded(canvas, 0f, 0f, width, height, 0f, tintAlpha << 24);
+        }
+        if (offlineDialogProgress > .01f) drawAnimatedDialog(canvas, offlineDialogProgress, 190f, () -> drawOfflineDialog(canvas));
+        if (microsoftDialogProgress > .01f) drawAnimatedDialog(canvas, microsoftDialogProgress, 166f, () -> drawMicrosoftDialog(canvas));
+        if (deleteDialogProgress > .01f) drawAnimatedDialog(canvas, deleteDialogProgress, 166f, () -> drawDeleteDialog(canvas));
+    }
+
+    private void drawMainCard(Canvas canvas, float x, float y, float w, float h) {
+        try (Paint card = new Paint(); Paint stroke = new Paint()) {
+            card.setAntiAlias(true);
+            card.setColor(0x32101010);
+            canvas.drawRRect(RRect.makeXYWH(x, y, w, h, 20f), card);
+            stroke.setAntiAlias(true);
+            stroke.setMode(PaintMode.STROKE);
+            stroke.setStrokeWidth(1f);
+            stroke.setColor(0x22FFFFFF);
+            canvas.drawRRect(RRect.makeXYWH(x + .5f, y + .5f, w - 1f, h - 1f, 20f), stroke);
+        }
+    }
+
+    private void drawAccounts(Canvas canvas, float x, float y, float w, float h, int alpha) {
+        List<AltManager.Account> accounts = AltManager.accounts();
+        syncAccountHover();
+        canvas.save();
+        canvas.clipRect(Rect.makeXYWH(x, y, w, h));
+        if (accounts.isEmpty()) {
+            drawCentered(canvas, "No accounts", x + w * .5f, y + h * .5f, 14f, (Math.round(alpha * .8f) << 24) | 0xFFFFFF);
+        } else {
+            float itemY = y - scroll;
+            for (int i = 0; i < accounts.size(); i++) {
+                drawAccount(canvas, accounts.get(i), i, x, itemY, w, 64f, alpha);
+                itemY += 72f;
+            }
+        }
+        canvas.restore();
+    }
+
+    private void drawAccount(Canvas canvas, AltManager.Account account, int index, float x, float y, float w, float h, int alpha) {
+        if (y + h < cardY() + 16f || y > cardY() + cardH() - 66f) return;
+        boolean over = mouseX >= x && mouseX <= x + w && mouseY >= y && mouseY <= y + h;
+        float hover = accountHover.get(index);
+        hover += ((over ? 1f : 0f) - hover) * .16f;
+        accountHover.set(index, hover);
+        float curve = hover * hover * (3f - 2f * hover);
+        boolean selectedNow = selected != null && selected.uuid().equals(account.uuid());
+        float selection = accountSelection.get(index);
+        selection += ((selectedNow ? 1f : 0f) - selection) * .16f;
+        accountSelection.set(index, selection);
+        float selectionCurve = selection * selection * (3f - 2f * selection);
+        boolean current = account.isCurrent();
+        try (Paint bg = new Paint(); Paint icon = new Paint()) {
+            bg.setAntiAlias(true);
+            float opacity = current
+            ? .15f + curve * .08f + selectionCurve * .08f
+            : .06f + curve * .13f + selectionCurve * .18f;
+            int backgroundColor = current
+            ? lerpRgb(0x8DE8AE, 0xB8F4CB, selectionCurve)
+            : lerpRgb(0xFFFFFF, 0x86D4FF, selectionCurve);
+            bg.setColor((Math.round(alpha * opacity) << 24) | backgroundColor);
+            canvas.drawRRect(RRect.makeXYWH(x, y, w, h, 13f), bg);
+            icon.setAntiAlias(true);
+            icon.setColor((Math.round(alpha * (.10f + .12f * curve)) << 24) | 0xFFFFFF);
+            canvas.drawRRect(RRect.makeXYWH(x + 10f, y + 10f, 44f, 44f, 10f), icon);
+        }
+        if (!drawAvatar(canvas, account, x + 10f, y + 10f, 44f, alpha)) {
+            String symbol = account.typeName().equals("Microsoft") ? "\uE853" : "\uE7FD";
+            float symbolSize = 24f;
+            float symbolWidth = SkijaUi.iconWidth(symbol, symbolSize, SkijaUi.IconSet.MATERIAL_SYMBOLS);
+            SkijaUi.icon(canvas, symbol, x + 32f - symbolWidth * .5f, (y + 39f) + SkijaUi.iconMetrics(symbolSize, SkijaUi.IconSet.MATERIAL_SYMBOLS).getAscent(), SkijaUi.iconMetrics(symbolSize, SkijaUi.IconSet.MATERIAL_SYMBOLS).getDescent() - SkijaUi.iconMetrics(symbolSize, SkijaUi.IconSet.MATERIAL_SYMBOLS).getAscent(), (Math.round(alpha * .86f) << 24) | 0xFFFFFF, symbolSize, SkijaUi.IconSet.MATERIAL_SYMBOLS);
+        }
+        SkijaUi.text(canvas, account.name(), x + 66f, (y + 26f) + SkijaUi.textMetrics(15f).getAscent(), SkijaUi.textMetrics(15f).getDescent() - SkijaUi.textMetrics(15f).getAscent(), (alpha << 24) | 0xFFFFFF, 15f);
+        String detail = account.typeName() + (account.isCurrent() ? "  |  Active" : "");
+        SkijaUi.text(canvas, detail, x + 66f, (y + 46f) + SkijaUi.textMetrics(11f).getAscent(), SkijaUi.textMetrics(11f).getDescent() - SkijaUi.textMetrics(11f).getAscent(), (Math.round(alpha * .72f) << 24) | 0xFFFFFF, 11f);
+    }
+
+    private void drawOfflineDialog(Canvas canvas) {
+        float w = dialogWidth();
+        float h = 190f;
+        float x = layoutCenterX() - w * .5f;
+        float y = layoutCenterY() - h * .5f;
+        drawDialogCard(canvas, x, y, w, h);
+        drawCentered(canvas, "Add Offline", layoutCenterX(), y + 38f, 18f, 0xFFFFFFFF);
+        SkijaUi.text(canvas, "Username", x + 24f, (y + 72f) + SkijaUi.textMetrics(12f).getAscent(), SkijaUi.textMetrics(12f).getDescent() - SkijaUi.textMetrics(12f).getAscent(), 0xB8FFFFFF, 12f);
+        drawInput(canvas, x + 24f, y + 84f, w - 48f, 34f);
+        float buttonW = (w - 56f) * .5f;
+        drawButton(canvas, x + 24f, y + 136f, buttonW, 30f, "Confirm", 255);
+        drawButton(canvas, x + 32f + buttonW, y + 136f, buttonW, 30f, "Cancel", 255);
+    }
+
+    private void drawDeleteDialog(Canvas canvas) {
+        float w = dialogWidth();
+        float h = 166f;
+        float x = layoutCenterX() - w * .5f;
+        float y = layoutCenterY() - h * .5f;
+        drawDialogCard(canvas, x, y, w, h);
+        drawCentered(canvas, "Delete Account", layoutCenterX(), y + 38f, 18f, 0xFFFFFFFF);
+        String accountName = deleteTarget == null ? "this account" : deleteTarget.name();
+        drawCentered(canvas, "Delete " + accountName + "?", layoutCenterX(), y + 82f, 13f, 0xCFFFFFFF);
+        float buttonW = (w - 56f) * .5f;
+        drawButton(canvas, x + 24f, y + 112f, buttonW, 30f, "Delete", 255);
+        drawButton(canvas, x + 32f + buttonW, y + 112f, buttonW, 30f, "Cancel", 255);
+    }
+
+    private void drawMicrosoftDialog(Canvas canvas) {
+        float w = dialogWidth();
+        float h = 166f;
+        float x = layoutCenterX() - w * .5f;
+        float y = layoutCenterY() - h * .5f;
+        drawDialogCard(canvas, x, y, w, h);
+        drawCentered(canvas, "Microsoft Login", layoutCenterX(), y + 38f, 18f, 0xFFFFFFFF);
+        if (microsoftSuccessAt > 0L) {
+            SkijaUi.icon(canvas, "\uE876", x + 24f, (y + 83f) + SkijaUi.iconMetrics(24f, SkijaUi.IconSet.MATERIAL_SYMBOLS).getAscent(), SkijaUi.iconMetrics(24f, SkijaUi.IconSet.MATERIAL_SYMBOLS).getDescent() - SkijaUi.iconMetrics(24f, SkijaUi.IconSet.MATERIAL_SYMBOLS).getAscent(), 0xFF62E58B, 24f, SkijaUi.IconSet.MATERIAL_SYMBOLS);
+        } else {
+            drawSpinner(canvas, x + 38f, y + 76f);
+        }
+        SkijaUi.text(canvas, microsoftStatus, x + 66f, (y + 80f) + SkijaUi.textMetrics(13f).getAscent(), SkijaUi.textMetrics(13f).getDescent() - SkijaUi.textMetrics(13f).getAscent(), microsoftStatusColor, 13f);
+        if (!deviceCode.isBlank()) {
+            SkijaUi.text(canvas, "Code: " + deviceCode, x + 24f, (y + 112f) + SkijaUi.textMetrics(11f).getAscent(), SkijaUi.textMetrics(11f).getDescent() - SkijaUi.textMetrics(11f).getAscent(), 0xB8FFFFFF, 11f);
+        }
+        float buttonW = (w - 56f) * .5f;
+        String copyLabel = System.currentTimeMillis() - deviceCodeCopiedAt < 1500L ? "Copied" : "Copy Code";
+        drawButton(canvas, x + 24f, y + 124f, buttonW, 26f, copyLabel, 255);
+        drawButton(canvas, x + 32f + buttonW, y + 124f, buttonW, 26f, "Cancel", 255);
+    }
+
+    private void drawDialogCard(Canvas canvas, float x, float y, float w, float h) {
+        SkijaUi.rounded(canvas, x, y, w, h, 20f, 0x12000000);
+        drawMainCard(canvas, x, y, w, h);
+    }
+
+    private void drawAnimatedDialog(Canvas canvas, float progress, float dialogHeight, Runnable renderer) {
+        float eased = ease(progress);
+        float scale = layoutScale() * (.90f + .10f * eased);
+        int save = canvas.saveLayerAlpha(Rect.makeXYWH(0f, 0f, width, height), Math.round(255f * eased));
+        try {
+            RRect bounds = RRect.makeXYWH((width - dialogWidth() * scale) * .5f,
+                    (height - dialogHeight * scale) * .5f, dialogWidth() * scale, dialogHeight * scale, 20f * scale);
+            SkijaRenderer.drawBlurredBackdrop(canvas, bounds, bounds.getLeft(), bounds.getTop(),
+                    bounds.getWidth(), bounds.getHeight(), 0.95f * 10.5f);
+            MainUiScale.applyPage(canvas, width, height, scale, layoutCenterX(), layoutCenterY());
+            renderer.run();
+        } finally {
+            canvas.restoreToCount(save);
+        }
+    }
+
+    private void drawInput(Canvas canvas, float x, float y, float w, float h) {
+        boolean over = inside(mouseX, mouseY, x, y, w, h);
+        try (Paint bg = new Paint(); Paint stroke = new Paint()) {
+            bg.setAntiAlias(true);
+            bg.setColor(((over ? 0x18 : 0x0E) << 24) | 0xFFFFFF);
+            canvas.drawRRect(RRect.makeXYWH(x, y, w, h, 10f), bg);
+            stroke.setAntiAlias(true);
+            stroke.setMode(PaintMode.STROKE);
+            stroke.setStrokeWidth(1f);
+            stroke.setColor(0x22FFFFFF);
+            canvas.drawRRect(RRect.makeXYWH(x + .5f, y + .5f, w - 1f, h - 1f, 10f), stroke);
+        }
+        String shown = input.isBlank() ? "Enter username" : input;
+        int color = input.isBlank() ? 0x8AFFFFFF : 0xFFFFFFFF;
+        SkijaUi.text(canvas, shown, x + 12f, (y + 22f) + SkijaUi.textMetrics(12f).getAscent(), SkijaUi.textMetrics(12f).getDescent() - SkijaUi.textMetrics(12f).getAscent(), color, 12f);
+        if ((System.currentTimeMillis() / 500L) % 2L == 0L) {
+            float cursorX = x + 12f + SkijaUi.textWidth(input, 12f);
+            try (Paint cursor = new Paint()) {
+                cursor.setColor(0xFFFFFFFF);
+                canvas.drawRect(Rect.makeXYWH(cursorX, y + 8f, 1f, h - 16f), cursor);
+            }
+        }
+    }
+
+    private void drawButton(Canvas canvas, float x, float y, float w, float h, String label, int alpha) {
+        drawButton(canvas, x, y, w, h, label, alpha, true);
+    }
+
+    private void drawButton(Canvas canvas, float x, float y, float w, float h, String label, int alpha, boolean enabled) {
+        boolean over = enabled && inside(mouseX, mouseY, x, y, w, h);
+        float hover = over ? 1f : 0f;
+        int color = enabled ? lerpRgb(0x67B9EA, 0xA7E0FF, hover) : 0x7D8790;
+        try (Paint bg = new Paint()) {
+            bg.setAntiAlias(true);
+            bg.setColor((Math.round(alpha * (enabled ? .20f + .12f * hover : .12f)) << 24) | color);
+            canvas.drawRRect(RRect.makeXYWH(x, y, w, h, 10f), bg);
+        }
+        float fontSize = h <= 28f ? 12f : 13f;
+        SkijaUi.text(canvas, label, x + (w - SkijaUi.textWidth(label, fontSize)) * .5f, (y + (h <= 28f ? 18f : 21f)) + SkijaUi.textMetrics(fontSize).getAscent(), SkijaUi.textMetrics(fontSize).getDescent() - SkijaUi.textMetrics(fontSize).getAscent(), (Math.round(alpha * (enabled ? 1f : .48f)) << 24) | 0xFFFFFF, fontSize);
+    }
+
+    private void drawSpinner(Canvas canvas, float x, float y) {
+        try (Paint paint = new Paint()) {
+            paint.setAntiAlias(true);
+            paint.setMode(PaintMode.STROKE);
+            paint.setStrokeWidth(3f);
+            paint.setColor(0xFFA7E0FF);
+            canvas.drawArc(
+            x - 14f,
+            y - 14f,
+            x + 14f,
+            y + 14f,
+            (System.currentTimeMillis() % 1200L) / 1200f * 360f,
+            270f,
+            false,
+            paint
+            );
+        }
+    }
+
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean consumed) {
+        if (event.button() != 0 || closingToMain) return true;
+        event = MainUiScale.pageEvent(event, width, height, inputScale(), layoutCenterX(), layoutCenterY());
+        float mx = (float) event.x();
+        float my = (float) event.y();
+        if (deleteConfirmOpen) {
+            float w = dialogWidth();
+            float h = 166f;
+            float x = layoutCenterX() - w * .5f;
+            float y = layoutCenterY() - h * .5f;
+            float buttonW = (w - 56f) * .5f;
+            if (inside(mx, my, x + 24f, y + 112f, buttonW, 30f)) {
+                playClick();
+                if (deleteTarget != null && !deleteTarget.isCurrent()) {
+                    AltManager.remove(deleteTarget);
+                    selected = currentAccount();
+                    showStatus("Account deleted.");
+                    syncAccountHover();
+                    clampScroll();
+                }
+                deleteConfirmOpen = false;
+                return true;
+            }
+            if (inside(mx, my, x + 32f + buttonW, y + 112f, buttonW, 30f)) {
+                playClick();
+                deleteConfirmOpen = false;
+            }
+            return true;
+        }
+        if (microsoftWaiting) {
+            float w = dialogWidth();
+            float h = 166f;
+            float x = layoutCenterX() - w * .5f;
+            float y = layoutCenterY() - h * .5f;
+            float buttonW = (w - 56f) * .5f;
+            if (inside(mx, my, x + 24f, y + 124f, buttonW, 26f)) {
+                playClick();
+                if (!deviceCode.isBlank() && minecraft != null) {
+                    minecraft.keyboardHandler.setClipboard(deviceCode);
+                    deviceCodeCopiedAt = System.currentTimeMillis();
+                }
+                return true;
+            }
+            if (inside(mx, my, x + 32f + buttonW, y + 124f, buttonW, 26f)) {
+                playClick();
+                microsoftWaiting = false;
+                showStatus("Microsoft login cancelled.");
+            }
+            return true;
+        }
+        if (offlineOpen) {
+            handleOfflineDialogClick(mx, my);
+            return true;
+        }
+        float x = cardX();
+        float buttonY = cardY() + cardH() + 12f;
+        float buttonW = (cardW() - 32f) / 5f;
+        if (inside(mx, my, bottomButtonX(x, buttonW, 0), buttonY, buttonW, 32f)) {
+            playClick();
+            if (selected != null) {
+                showStatus(AltManager.login(selected) ? "Logged in as " + selected.name() : "Login failed.");
+            }
+            return true;
+        }
+        if (inside(mx, my, bottomButtonX(x, buttonW, 1), buttonY, buttonW, 32f)) {
+            playClick();
+            if (selected != null) {
+                if (selected.isCurrent()) {
+                    showStatus("The current account cannot be deleted.");
+                } else {
+                    deleteTarget = selected;
+                    deleteConfirmOpen = true;
+                }
+            }
+            return true;
+        }
+        if (inside(mx, my, bottomButtonX(x, buttonW, 2), buttonY, buttonW, 32f)) {
+            playClick();
+            startMicrosoftLogin();
+            return true;
+        }
+        if (inside(mx, my, bottomButtonX(x, buttonW, 3), buttonY, buttonW, 32f)) {
+            playClick();
+            offlineOpen = true;
+            input = "";
+            return true;
+        }
+        if (inside(mx, my, bottomButtonX(x, buttonW, 4), buttonY, buttonW, 32f)) {
+            playClick();
+            startClose();
+            return true;
+        }
+        int hit = accountAt(mx, my);
+        if (hit >= 0) {
+            long now = System.currentTimeMillis();
+            AltManager.Account account = AltManager.accounts().get(hit);
+            selected = account;
+            if (lastAccountClick == hit && now - lastAccountClickMs <= 350L) {
+                playClick();
+                showStatus(AltManager.login(account) ? "Logged in as " + account.name() : "Login failed.");
+                lastAccountClick = -1;
+                lastAccountClickMs = 0L;
+            } else {
+                lastAccountClick = hit;
+                lastAccountClickMs = now;
+            }
+        }
+        return true;
+    }
+
+    private void handleOfflineDialogClick(float mx, float my) {
+        float w = dialogWidth();
+        float h = 190f;
+        float x = layoutCenterX() - w * .5f;
+        float y = layoutCenterY() - h * .5f;
+        float buttonW = (w - 56f) * .5f;
+        if (inside(mx, my, x + 24f, y + 136f, buttonW, 30f)) {
+            playClick();
+            AltManager.Account account = AltManager.addOffline(input);
+            if (account == null) {
+                showStatus("Invalid account name.");
+            } else {
+                selected = account;
+                showStatus("Account added.");
+                offlineOpen = false;
+                input = "";
+                syncAccountHover();
+                clampScroll();
+            }
+            return;
+        }
+        if (inside(mx, my, x + 32f + buttonW, y + 136f, buttonW, 30f)) {
+            playClick();
+            offlineOpen = false;
+            input = "";
+        }
+    }
+
+    private void startMicrosoftLogin() {
+        microsoftWaiting = true;
+        showStatus("Waiting for Microsoft authorization.");
+        deviceCode = "";
+        microsoftStatus = "Requesting device code...";
+        microsoftStatusColor = 0xFFFFFFFF;
+        deviceExpiresAt = 0L;
+        deviceCodeCopiedAt = 0L;
+        microsoftSuccessAt = 0L;
+        MicrosoftAuth.login(info -> {
+            String[] parts = info.split("\\n", 3);
+            String code = parts.length > 0 ? parts[0] : "";
+            long seconds;
+            try {
+                seconds = parts.length > 2 ? Long.parseLong(parts[2]) : 900L;
+            } catch (NumberFormatException ignored) {
+                seconds = 900L;
+            }
+            long expiresAt = System.currentTimeMillis() + seconds * 1000L;
+            deviceCode = code;
+            deviceExpiresAt = expiresAt;
+            if (!code.isBlank() && minecraft != null) {
+                minecraft.keyboardHandler.setClipboard(code);
+                deviceCodeCopiedAt = System.currentTimeMillis();
+            }
+        }, value -> {
+            microsoftStatus = value;
+            microsoftStatusColor = 0xFFFFFFFF;
+        }, account -> Minecraft.getInstance().execute(() -> {
+            AltManager.add(account);
+            selected = account;
+            microsoftStatus = "Microsoft login successful.";
+            microsoftStatusColor = 0xFF62E58B;
+            microsoftSuccessAt = System.currentTimeMillis();
+            showStatus("Microsoft login succeeded: " + account.name());
+            syncAccountHover();
+            clampScroll();
+        }), error -> Minecraft.getInstance().execute(() -> {
+            microsoftStatus = error == null || error.isBlank() ? "Microsoft login failed." : error;
+            microsoftStatusColor = 0xFFFF7777;
+            showStatus(microsoftStatus);
+        }));
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+        if (offlineOpen || microsoftWaiting || deleteConfirmOpen) return true;
+        targetScroll -= (float) verticalAmount * 48f;
+        clampScroll();
+        return true;
+    }
+
+    @Override
+    public boolean keyPressed(KeyEvent event) {
+        if (event.key() == 256) {
+            if (offlineOpen) {
+                offlineOpen = false;
+                input = "";
+            } else if (microsoftWaiting) {
+                microsoftWaiting = false;
+                showStatus("Microsoft login cancelled.");
+            } else if (deleteConfirmOpen) {
+                deleteConfirmOpen = false;
+            } else {
+                startClose();
+            }
+            return true;
+        }
+        if (offlineOpen && event.key() == 259 && !input.isEmpty()) {
+            input = input.substring(0, input.length() - 1);
+            return true;
+        }
+        if (offlineOpen && event.key() == 257) {
+            AltManager.Account account = AltManager.addOffline(input);
+            if (account == null) {
+                showStatus("Invalid account name.");
+            } else {
+                selected = account;
+                showStatus("Account added.");
+                offlineOpen = false;
+                input = "";
+                syncAccountHover();
+                clampScroll();
+            }
+            return true;
+        }
+        return true;
+    }
+
+    @Override
+    public boolean charTyped(CharacterEvent event) {
+        if (offlineOpen && event.isAllowedChatCharacter() && input.length() < 16) {
+            input += event.codepointAsString();
+        }
+        return true;
+    }
+
+    @Override
+    public void onClose() {
+        if (offlineOpen) {
+            offlineOpen = false;
+            input = "";
+            return;
+        }
+        if (microsoftWaiting) {
+            microsoftWaiting = false;
+            showStatus("Microsoft login cancelled.");
+            return;
+        }
+        if (deleteConfirmOpen) {
+            deleteConfirmOpen = false;
+            return;
+        }
+        startClose();
+    }
+
+    @Override
+    public void removed() {
+        pendingFrame = false;
+        for (Image image : accountAvatars.values()) {
+            if (image != null) image.close();
+        }
+        accountAvatars.clear();
+        pendingAvatars.clear();
+        if (offlineAvatar != null) {
+            offlineAvatar.close();
+            offlineAvatar = null;
+        }
+
+        super.removed();
+    }
+
+    private void startClose() {
+        if (closingToMain || backDispatched) return;
+        if (embeddedBack != null && minecraft != null && minecraft.gui.screen() != this) {
+            backDispatched = true;
+            embeddedBack.run();
+            return;
+        }
+        closingToMain = true;
+        closeStartMs = System.currentTimeMillis();
+    }
+
+    private int accountAt(float mx, float my) {
+        float x = cardX() + 16f;
+        float y = cardY() + 16f;
+        float w = cardW() - 32f;
+        float h = cardH() - 82f;
+        if (mx < x || mx > x + w || my < y || my > y + h) return -1;
+        int index = (int) ((my - y + scroll) / 72f);
+        float inside = (my - y + scroll) - index * 72f;
+        return index >= 0 && index < AltManager.accounts().size() && inside <= 64f ? index : -1;
+    }
+
+    private void syncAccountHover() {
+        int size = AltManager.accounts().size();
+        while (accountHover.size() < size) accountHover.add(0f);
+        while (accountHover.size() > size) accountHover.remove(accountHover.size() - 1);
+        while (accountSelection.size() < size) accountSelection.add(0f);
+        while (accountSelection.size() > size) accountSelection.remove(accountSelection.size() - 1);
+    }
+
+    private boolean drawAvatar(Canvas canvas, AltManager.Account account, float x, float y, float size, int alpha) {
+        Image image = avatar(account);
+        if (image == null) {
+            image = offlineAvatar();
+            if (image == null) return false;
+            try (Paint paint = new Paint()) {
+                paint.setAntiAlias(true);
+                paint.setColor((alpha << 24) | 0xFFFFFF);
+                canvas.save();
+                canvas.clipRRect(RRect.makeXYWH(x, y, size, size, 10f), true);
+                canvas.drawImageRect(
+                image,
+                Rect.makeXYWH(0f, 0f, image.getWidth(), image.getHeight()),
+                Rect.makeXYWH(x, y, size, size),
+                SamplingMode.DEFAULT,
+                paint,
+                true
+                );
+                canvas.restore();
+            }
+            return true;
+        }
+        float scaleX = image.getWidth() / 64f;
+        float scaleY = image.getHeight() / 64f;
+        Rect destination = Rect.makeXYWH(x, y, size, size);
+        try (Paint paint = new Paint()) {
+            paint.setAntiAlias(true);
+            paint.setColor((alpha << 24) | 0xFFFFFF);
+            canvas.save();
+            canvas.clipRRect(RRect.makeXYWH(x, y, size, size, 10f), true);
+            canvas.drawImageRect(
+            image,
+            Rect.makeXYWH(8f * scaleX, 8f * scaleY, 8f * scaleX, 8f * scaleY),
+            destination,
+            SamplingMode.DEFAULT,
+            paint,
+            true
+            );
+            canvas.drawImageRect(
+            image,
+            Rect.makeXYWH(40f * scaleX, 8f * scaleY, 8f * scaleX, 8f * scaleY),
+            destination,
+            SamplingMode.DEFAULT,
+            paint,
+            true
+            );
+            canvas.restore();
+        }
+        return true;
+    }
+
+    private Image avatar(AltManager.Account account) {
+        UUID uuid = account.uuid();
+        if (accountAvatars.containsKey(uuid)) return accountAvatars.get(uuid);
+        CompletableFuture<byte[]> pending = pendingAvatars.get(uuid);
+        if (pending == null) {
+            pendingAvatars.put(uuid, AltAvatarLoader.load(account));
+            return null;
+        }
+        if (!pending.isDone()) return null;
+        pendingAvatars.remove(uuid);
+        try {
+            byte[] bytes = pending.join();
+            Image image = bytes == null || bytes.length == 0 ? null : Image.makeFromEncoded(bytes);
+            accountAvatars.put(uuid, image);
+            return image;
+        } catch (RuntimeException ignored) {
+            accountAvatars.put(uuid, null);
+            return null;
+        }
+    }
+
+    private Image offlineAvatar() {
+        if (offlineAvatar != null) return offlineAvatar;
+        try (InputStream stream = AltManagerScreen.class.getResourceAsStream("/assets/pvp_utils/textures/Offline.png")) {
+            if (stream != null) offlineAvatar = Image.makeFromEncoded(stream.readAllBytes());
+        } catch (Exception ignored) {
+            offlineAvatar = null;
+        }
+        return offlineAvatar;
+    }
+
+    private AltManager.Account currentAccount() {
+        for (AltManager.Account account : AltManager.accounts()) {
+            if (account.isCurrent()) return account;
+        }
+        return null;
+    }
+
+    private String currentLoginText() {
+        AltManager.Account account = currentAccount();
+        if (account != null) {
+            return "Logged in as " + account.name() + " (" + account.typeName() + ")";
+        }
+        if (minecraft != null && minecraft.getUser() != null) {
+            String type = minecraft.getUser().getXuid().isPresent() || minecraft.getUser().getClientId().isPresent()
+            ? "Microsoft"
+            : "Offline";
+            return "Logged in as " + minecraft.getUser().getName() + " (" + type + ")";
+        }
+        return "No account is currently logged in";
+    }
+
+    private void clampScroll() {
+        float max = Math.max(0f, AltManager.accounts().size() * 72f - (cardH() - 82f));
+        targetScroll = Math.max(0f, Math.min(max, targetScroll));
+        scroll = Math.max(0f, Math.min(max, scroll));
+    }
+
+    private void playClick() {
+        if (minecraft != null) {
+            minecraft.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1f));
+        }
+    }
+
+    private void showStatus(String value) {
+        status = value == null ? "" : value;
+        statusExpiresAt = status.isBlank() ? 0L : System.currentTimeMillis() + 2600L;
+    }
+
+    private float animate(float current, float target) {
+        float next = current + (target - current) * .18f;
+        return Math.abs(next - target) < .002f ? target : next;
+    }
+
+    private void drawCentered(Canvas canvas, String text, float centerX, float y, float size, int color) {
+        SkijaUi.text(canvas, text, centerX - SkijaUi.textWidth(text, size) * .5f, (y) + SkijaUi.textMetrics(size).getAscent(), SkijaUi.textMetrics(size).getDescent() - SkijaUi.textMetrics(size).getAscent(), color, size);
+    }
+
+    private boolean inside(double mx, double my, float x, float y, float w, float h) {
+        return mx >= x && mx <= x + w && my >= y && my <= y + h;
+    }
+
+    private float bottomButtonX(float x, float buttonW, int index) {
+        return x + index * (buttonW + 8f);
+    }
+
+    private float openProgress() {
+        return Math.max(0f, Math.min(1f, (System.currentTimeMillis() - openStartMs) / (float) OPEN_MS));
+    }
+
+    private float closeProgress() {
+        if (!closingToMain || closeStartMs <= 0L) return 0f;
+        return Math.max(0f, Math.min(1f, (System.currentTimeMillis() - closeStartMs) / (float) CLOSE_MS));
+    }
+
+    private float ease(float value) {
+        float t = 1f - Math.max(0f, Math.min(1f, value));
+        return 1f - t * t * t;
+    }
+
+    private int lerpRgb(int from, int to, float t) {
+        int r = Math.round(((from >> 16) & 255) + (((to >> 16) & 255) - ((from >> 16) & 255)) * t);
+        int g = Math.round(((from >> 8) & 255) + (((to >> 8) & 255) - ((from >> 8) & 255)) * t);
+        int b = Math.round((from & 255) + ((to & 255) - (from & 255)) * t);
+        return (r << 16) | (g << 8) | b;
+    }
+
+    private float cardW() {
+        return Math.max(320f, Math.min(500f, layoutWidth() * .52f));
+    }
+
+    private float cardH() {
+        return Math.max(260f, Math.min(layoutHeight() - 154f, layoutHeight() * .72f));
+    }
+
+    private float cardX() {
+        return (layoutWidth() - cardW()) * .5f;
+    }
+
+    private float cardY() {
+        return 76f;
+    }
+
+    private float titleY() {
+        return Math.min(50f, cardY() + 12f);
+    }
+
+    private int layoutWidth() {
+        return MainUiScale.pageWidth();
+    }
+
+    private int layoutHeight() {
+        return MainUiScale.pageHeight();
+    }
+
+    private float layoutScale() {
+        return MainUiScale.pageScale(cardX(), 20f, cardX() + cardW(), cardY() + cardH() + 44f);
+    }
+
+    private float layoutCenterX() {
+        return layoutWidth() * .5f;
+    }
+
+    private float layoutCenterY() {
+        return (20f + cardY() + cardH() + 44f) * .5f;
+    }
+
+    private float dialogWidth() {
+        return Math.min(380f, cardW());
+    }
+
+    private float inputScale() {
+        float progress = offlineOpen ? offlineDialogProgress
+                : microsoftWaiting ? microsoftDialogProgress
+                : deleteConfirmOpen ? deleteDialogProgress : 1f;
+        return layoutScale() * (.90f + .10f * ease(progress));
+    }
+}

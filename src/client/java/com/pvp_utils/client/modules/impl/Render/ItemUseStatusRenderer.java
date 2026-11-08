@@ -1,0 +1,441 @@
+package com.pvp_utils.client.modules.impl.Render;
+
+import com.pvp_utils.client.compat.ItemTagCompat;
+import io.github.humbleui.types.RRect;
+
+import com.pvp_utils.client.render.skia.SkijaUi;
+
+import com.pvp_utils.client.render.skia.SkijaRenderer;
+import com.pvp_utils.Config;
+import io.github.humbleui.skija.Paint;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.tags.ItemTags;
+import net.minecraft.util.Mth;
+import net.minecraft.world.item.CrossbowItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+
+public final class ItemUseStatusRenderer {
+    private static final ItemUseStatusRenderer INSTANCE = new ItemUseStatusRenderer();
+    private static final long ANIM_DURATION_MS = 180L;
+    private static final long HIDE_DELAY_MS = 120L;
+    private static final int BAR_W = 140;
+    private static final int BAR_H = 12;
+    private static final int LITE_EDIT_H = 30;
+    private static final int BORDER = 1;
+    private static final int NEW_W = 174;
+    private static final int NEW_H = 28;
+    private static final float NEW_BAR_X = 6f;
+    private static final float NEW_BAR_Y = 10f;
+    private static final float NEW_BAR_W = 132f;
+    private static final float NEW_BAR_H = 7f;
+    private static final int VANILLA_CROSSBOW_CHARGE_TICKS = 25;
+    private static final int VANILLA_SPEAR_DAMAGE_USE_TICKS = 10;
+
+    private long appearTime;
+    private long lastActiveTime;
+    private long lastMixinSampleTime;
+    private boolean visible;
+    private boolean mixinActive;
+    private float lastProgress;
+    private float mixinProgress;
+    private float animatedProgress;
+    private String lastItemName = "Item";
+    private long lastFrameTime;
+
+    private final Paint newTrackPaint = new Paint();
+    private final Paint newFillPaint = new Paint();
+
+    private ItemUseStatusRenderer() {
+        newTrackPaint.setAntiAlias(true);
+        newFillPaint.setAntiAlias(true);
+    }
+
+    public static ItemUseStatusRenderer getInstance() {
+        return INSTANCE;
+    }
+
+    public float getEditWidth() {
+        return getBaseWidth() * getScale();
+    }
+
+    public float getEditHeight() {
+        return getBaseHeight() * getScale();
+    }
+
+    public float getDefaultY(int screenH) {
+        return screenH * 0.5f + (Config.itemUseStatusMode == Config.ItemUseStatusMode.NEW ? 13f : 18f);
+    }
+
+    public float getRenderX(int screenW) {
+        float w = getEditWidth();
+        return clamp((screenW - w) * 0.5f + Config.itemUseStatusX, 0f, Math.max(0f, screenW - w));
+    }
+
+    public float getRenderY(int screenH) {
+        float h = getEditHeight();
+        return clamp(getDefaultY(screenH) + Config.itemUseStatusY, 0f, Math.max(0f, screenH - h));
+    }
+
+    public void captureFromMixin(LocalPlayer player) {
+        Minecraft client = Minecraft.getInstance();
+        if (player == null || client == null || client.player != player) return;
+
+        boolean enabled = Config.itemUseStatus || (Config.dynamicIsland && Config.dynamicIslandItemUseStatus);
+        boolean using = player.isUsingItem();
+        ItemStack stack = player.getUseItem();
+        int remaining = using ? player.getUseItemRemainingTicks() : 0;
+        int rawDuration = !stack.isEmpty() ? stack.getUseDuration(player) : 0;
+        boolean eligible = !stack.isEmpty() && shouldDisplay(stack);
+        int displayDuration = !stack.isEmpty() ? getDisplayDuration(stack, player) : 0;
+
+        if (!enabled || !using || stack.isEmpty() || !eligible || displayDuration <= 0 || remaining < 0) {
+            mixinActive = false;
+            return;
+        }
+
+        int usedTicks = getUsedTicks(stack, remaining, displayDuration, rawDuration);
+        mixinProgress = calculateProgress(stack, usedTicks, displayDuration, rawDuration);
+        mixinActive = true;
+        lastMixinSampleTime = System.currentTimeMillis();
+    }
+
+    public void extractRenderState(GuiGraphicsExtractor graphics) {
+        Minecraft client = Minecraft.getInstance();
+        if (!Config.itemUseStatus) {
+            if (!(Config.dynamicIsland && Config.dynamicIslandItemUseStatus)) {
+                visible = false;
+                lastProgress = 0.0f;
+                animatedProgress = 0.0f;
+                lastItemName = "Item";
+                lastFrameTime = 0L;
+            }
+            return;
+        }
+        long now = System.currentTimeMillis();
+        UseState state = currentUseState(client, now);
+        boolean activeNow = state != null;
+
+        if (client.player == null || client.level == null || state == null) {
+            if (client.player == null || client.level == null) {
+                visible = false;
+                lastProgress = 0.0f;
+                lastItemName = "Item";
+                return;
+            }
+        }
+
+        if (state != null) {
+            if (!visible) {
+                appearTime = now;
+                visible = true;
+                animatedProgress = state.progress();
+            }
+            lastActiveTime = now;
+            lastProgress = state.progress();
+            lastItemName = state.itemName();
+        }
+
+        if (!visible) return;
+
+        updateAnimatedProgress(now);
+
+        float fadeIn = (now - appearTime) / (float) ANIM_DURATION_MS;
+        float fadeOut = 1.0f - (now - (lastActiveTime + HIDE_DELAY_MS)) / (float) ANIM_DURATION_MS;
+        float alpha = easeOutCubic(Mth.clamp(Math.min(fadeIn, fadeOut), 0.0f, 1.0f));
+        if (alpha <= 0.0f) {
+            if (!activeNow) {
+                visible = false;
+                lastProgress = 0.0f;
+                animatedProgress = 0.0f;
+                lastItemName = "Item";
+                lastFrameTime = 0L;
+            }
+            return;
+        }
+
+        if (Config.itemUseStatusMode == Config.ItemUseStatusMode.NEW) {
+            renderNew(graphics, client, animatedProgress, alpha);
+        } else {
+            renderLite(graphics, client, animatedProgress, alpha);
+        }
+    }
+
+    public Snapshot snapshot(Minecraft client) {
+        if (!Config.dynamicIsland || !Config.dynamicIslandItemUseStatus || client == null) {
+            return Snapshot.EMPTY;
+        }
+        long now = System.currentTimeMillis();
+        UseState state = currentUseState(client, now);
+        boolean activeNow = state != null;
+
+        if (client.player == null || client.level == null) {
+            visible = false;
+            lastProgress = 0.0f;
+            animatedProgress = 0.0f;
+            lastItemName = "Item";
+            lastFrameTime = 0L;
+            return Snapshot.EMPTY;
+        }
+
+        if (state != null) {
+            if (!visible) {
+                appearTime = now;
+                visible = true;
+                animatedProgress = state.progress();
+            }
+            lastActiveTime = now;
+            lastProgress = state.progress();
+            lastItemName = state.itemName();
+        }
+
+        if (!visible) return Snapshot.EMPTY;
+        updateAnimatedProgress(now);
+
+        float fadeIn = (now - appearTime) / (float) ANIM_DURATION_MS;
+        float fadeOut = 1.0f - (now - (lastActiveTime + HIDE_DELAY_MS)) / (float) ANIM_DURATION_MS;
+        float alpha = easeOutCubic(Mth.clamp(Math.min(fadeIn, fadeOut), 0.0f, 1.0f));
+        if (alpha <= 0.0f) {
+            if (!activeNow) {
+                visible = false;
+                lastProgress = 0.0f;
+                animatedProgress = 0.0f;
+                lastItemName = "Item";
+                lastFrameTime = 0L;
+            }
+            return Snapshot.EMPTY;
+        }
+
+        String itemName = state != null ? state.itemName() : lastItemName;
+        return new Snapshot(true, alpha, itemName, animatedProgress);
+    }
+
+    private UseState currentUseState(Minecraft client, long now) {
+        if (client == null || client.player == null || client.level == null || client.gameMode == null) return null;
+        Screen screen = client.gui.screen();
+        if (screen != null) return null;
+
+        if (mixinActive && now - lastMixinSampleTime < 250L) {
+            ItemStack stack = client.player.getUseItem();
+            String itemName = stack.isEmpty() ? "Item" : stack.getHoverName().getString();
+            return new UseState(mixinProgress, itemName);
+        }
+
+        if (!client.player.isUsingItem()) return null;
+
+        ItemStack stack = client.player.getUseItem();
+        if (stack.isEmpty() || !shouldDisplay(stack)) return null;
+
+        int duration = getDisplayDuration(stack, client.player);
+        int remaining = client.player.getUseItemRemainingTicks();
+        if (duration <= 0 || remaining < 0) return null;
+
+        int rawDuration = stack.getUseDuration(client.player);
+        int usedTicks = getUsedTicks(stack, remaining, duration, rawDuration);
+        float progress = calculateProgress(stack, usedTicks, duration, rawDuration);
+        return new UseState(progress, stack.getHoverName().getString());
+    }
+
+    private boolean shouldDisplay(ItemStack stack) {
+        return stack.get(DataComponents.FOOD) != null
+        || stack.get(DataComponents.CONSUMABLE) != null
+        || stack.is(Items.BOW)
+        || stack.is(Items.CROSSBOW)
+        || stack.is(Items.TRIDENT)
+        || ItemTagCompat.isSpear(stack)
+        || stack.is(Items.POTION)
+        || stack.is(Items.SPLASH_POTION)
+        || stack.is(Items.LINGERING_POTION)
+        || stack.is(Items.BRUSH);
+    }
+
+    private int getDisplayDuration(ItemStack stack, LocalPlayer player) {
+        if (stack.is(Items.BOW)) {
+            return 20;
+        }
+        if (stack.is(Items.CROSSBOW)) {
+            return getCrossbowUseDuration(stack, player);
+        }
+        if (stack.is(Items.TRIDENT)) {
+            return 10;
+        }
+        if (ItemTagCompat.isSpear(stack)) {
+            return getSpearUseDuration(stack, player);
+        }
+        if (stack.is(Items.BRUSH)) {
+            return 10;
+        }
+        if (player == null) {
+            return 0;
+        }
+        int duration = stack.getUseDuration(player);
+        return duration > 0 ? duration : 32;
+    }
+
+    private float calculateProgress(ItemStack stack, int usedTicks, int displayDuration, int rawDuration) {
+        if (ItemTagCompat.isSpear(stack)) {
+            return 1.0f - Mth.clamp(usedTicks / (float) Math.max(1, displayDuration), 0.0f, 1.0f);
+        }
+        return Mth.clamp(usedTicks / (float) displayDuration, 0.0f, 1.0f);
+    }
+
+    private int getUsedTicks(ItemStack stack, int remaining, int displayDuration, int rawDuration) {
+        int baselineDuration = rawDuration > 0 ? rawDuration : displayDuration;
+        if (ItemTagCompat.isSpear(stack)) {
+            baselineDuration = rawDuration >= 72000 || rawDuration <= 0 ? 72000 : rawDuration;
+        }
+        return Math.max(0, baselineDuration - remaining);
+    }
+
+    private int getCrossbowUseDuration(ItemStack stack, LocalPlayer player) {
+        try {
+            return Math.max(1, CrossbowItem.getChargeDuration(stack, player));
+        } catch (Throwable ignored) {
+            return getVanillaCrossbowUseDuration(player);
+        }
+    }
+
+    private int getVanillaCrossbowUseDuration(LocalPlayer player) {
+        try {
+            return Math.max(1, CrossbowItem.getChargeDuration(new ItemStack(Items.CROSSBOW), player));
+        } catch (Throwable ignored) {
+            return VANILLA_CROSSBOW_CHARGE_TICKS;
+        }
+    }
+
+    private int getSpearUseDuration(ItemStack stack, LocalPlayer player) {
+        int duration = getKineticUseDuration(stack);
+        if (duration > 0) {
+            return duration;
+        }
+
+        ItemStack vanillaStack = new ItemStack(stack.getItem());
+        duration = getKineticUseDuration(vanillaStack);
+        if (duration > 0) {
+            return duration;
+        }
+
+        int rawDuration = player == null ? 0 : vanillaStack.getUseDuration(player);
+        if (rawDuration > 0 && rawDuration < 72000) {
+            return rawDuration;
+        }
+
+        return VANILLA_SPEAR_DAMAGE_USE_TICKS;
+    }
+
+    private int getKineticUseDuration(ItemStack stack) {
+        // 1.21.10 has no kinetic weapon component (introduced in 1.21.11), no kinetic charge time here.
+        return 0;
+    }
+
+    private void renderLite(GuiGraphicsExtractor graphics, Minecraft client, float progress, float alpha) {
+        int screenW = client.getWindow().getGuiScaledWidth();
+        int screenH = client.getWindow().getGuiScaledHeight();
+        float scale = getScale();
+        int x = Math.round(getRenderX(screenW));
+        int y = Math.round(getRenderY(screenH));
+        int alphaInt = Math.round(alpha * 255.0f);
+        int alphaBits = alphaInt << 24;
+
+        graphics.pose().pushMatrix();
+        graphics.pose().translate(x, y);
+        graphics.pose().scale(scale, scale);
+        graphics.pose().translate(-x, -y);
+        graphics.outline(x, y, BAR_W, BAR_H, alphaBits | 0xFFFFFF);
+
+        int innerW = BAR_W - BORDER * 2;
+        int fillW = Math.max(0, Math.min(innerW, Math.round(innerW * Mth.clamp(progress, 0.0f, 1.0f))));
+        if (fillW > 0) {
+            graphics.fill(x + BORDER, y + BORDER, x + BORDER + fillW, y + BAR_H - BORDER, progressColor(progress, alphaInt));
+        }
+
+        int percent = Math.round(Mth.clamp(progress, 0.0f, 1.0f) * 100.0f);
+        String text = percent + "%";
+        int textW = client.font.width(text);
+        int textX = x + BORDER + fillW - textW / 2;
+        textX = Math.max(x, Math.min(textX, x + BAR_W - textW));
+        int textY = y + BAR_H + 4;
+        graphics.text(client.font, Component.literal(text), textX, textY, alphaBits | 0xFFFFFF, true);
+        graphics.pose().popMatrix();
+    }
+
+    private void renderNew(GuiGraphicsExtractor graphics, Minecraft client, float progress, float alpha) {
+        float scale = getScale();
+        float x = getRenderX(client.getWindow().getGuiScaledWidth());
+        float y = getRenderY(client.getWindow().getGuiScaledHeight());
+        SkijaRenderer.draw(c -> {
+            c.translate(x, y);
+            c.scale(scale, scale);
+            int alphaInt = Math.round(Mth.clamp(alpha, 0.0f, 1.0f) * 255f);
+            newTrackPaint.setColor((Math.round(alphaInt * 0.22f) << 24) | (Config.hudTheme == Config.HudTheme.LIGHT ? 0x111827 : 0xFFFFFF));
+            c.drawRRect(RRect.makeXYWH(NEW_BAR_X, NEW_BAR_Y, NEW_BAR_W, NEW_BAR_H, NEW_BAR_H * 0.5f), newTrackPaint);
+
+            float fillW = Math.max(NEW_BAR_H, NEW_BAR_W * Mth.clamp(progress, 0.0f, 1.0f));
+            newFillPaint.setColor((alphaInt << 24) | (progressColor(progress, 255) & 0xFFFFFF));
+            c.drawRRect(RRect.makeXYWH(NEW_BAR_X, NEW_BAR_Y, fillW, NEW_BAR_H, NEW_BAR_H * 0.5f), newFillPaint);
+
+            int textColor = (alphaInt << 24) | 0xFFFFFF;
+            SkijaUi.text(c, Math.round(Mth.clamp(progress, 0.0f, 1.0f) * 100.0f) + "%", 146f, (17f) + SkijaUi.textMetrics(10f).getAscent(), SkijaUi.textMetrics(10f).getDescent() - SkijaUi.textMetrics(10f).getAscent(), textColor, 10f);
+        });
+    }
+
+    private void updateAnimatedProgress(long now) {
+        if (lastFrameTime <= 0L) {
+            lastFrameTime = now;
+            animatedProgress = lastProgress;
+            return;
+        }
+        float dt = Math.min(0.05f, Math.max(0.0f, (now - lastFrameTime) / 1000.0f));
+        lastFrameTime = now;
+        float follow = 1.0f - (float) Math.pow(0.0008f, dt);
+        animatedProgress += (lastProgress - animatedProgress) * Mth.clamp(follow, 0.0f, 1.0f);
+    }
+
+    private float easeOutCubic(float value) {
+        float t = 1.0f - Mth.clamp(value, 0.0f, 1.0f);
+        return 1.0f - t * t * t;
+    }
+
+    private int progressColor(float progress, int alpha) {
+        progress = Mth.clamp(progress, 0.0f, 1.0f);
+        int r;
+        int g;
+        if (progress < 0.5f) {
+            float t = progress * 2.0f;
+            r = 255;
+            g = Math.round(255.0f * t);
+        } else {
+            float t = (progress - 0.5f) * 2.0f;
+            r = Math.round(255.0f * (1.0f - t));
+            g = 255;
+        }
+        return ((alpha & 0xFF) << 24) | (r << 16) | (g << 8);
+    }
+
+    private float getBaseWidth() {
+        return Config.itemUseStatusMode == Config.ItemUseStatusMode.NEW ? NEW_W : BAR_W;
+    }
+
+    private float getBaseHeight() {
+        return Config.itemUseStatusMode == Config.ItemUseStatusMode.NEW ? NEW_H : LITE_EDIT_H;
+    }
+
+    private float getScale() {
+        return Math.max(0.5f, Config.itemUseStatusScale);
+    }
+
+    private float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    public record Snapshot(boolean visible, float alpha, String itemName, float progress) {
+        public static final Snapshot EMPTY = new Snapshot(false, 0f, "", 0f);
+    }
+
+    private record UseState(float progress, String itemName) {}
+}
