@@ -37,6 +37,26 @@ the same code base on the Minecraft version of this branch:
 5. All IRC functionality has been removed. Upstream ships IRC as PAHP-protected binaries without
    source, which cannot be redistributed in source form. This port contains **no IRC code and no
    PAHP payloads**; the corresponding UI entries are removed as well.
+6. **Vulkan graphics backend compatibility (added by this port).** Minecraft 26.2 ships an official
+   Vulkan backend (`com.mojang.blaze3d.vulkan.VulkanBackend`) selectable in video settings next to
+   OpenGL (`PreferredGraphicsApi`, `Options.preferredGraphicsBackend`). Upstream renders its Skija UI
+   by drawing directly into the default framebuffer through Skija's GL backend, which cannot work
+   without an OpenGL context. This port adds:
+   - `com/pvp_utils/client/compat/GpuApi` — runtime backend detection (device info `backendName`,
+     fallback `RenderSystem.getBackendDescription()`), plus `-Dpvp_utils.forceVulkan` /
+     `-Dpvp_utils.forceOpenGl` overrides for diagnostics.
+   - `com/pvp_utils/client/render/skia/SkijaRasterCanvas` — CPU raster path
+     (`Surface.makeRasterN32Premul`) with BGRA→RGBA read-back into a `DynamicTexture`, uploaded
+     through `CommandEncoder#writeToTexture`.
+   - `SkijaRenderer` split into an OpenGL path (unchanged semantics) and `renderVulkanFrame(...)`,
+     which composites every queued painter into the raster canvas and blits the result through
+     `GuiGraphicsExtractor#blit`; `SkijaFrameRenderer#drawFrameLayers()` became the shared layer list.
+   - `SkijaVulkanGuiMixin` — injects the Vulkan composite at `Gui#extractRenderState` TAIL, the point
+     where 26.x GUI render state is complete.
+   - Graceful degradation where a GL context is structurally required: `MainUIShader` (falls back to
+     the vanilla gradient), `LiquidGlassRenderer` / `GlassCaptureRenderer` (framebuffer capture is
+     unavailable, panels fall back to the normal style), and all `borrowTexture`/GL resource paths.
+   No Vulkan-specific shaders or new third-party libraries were added; the OpenGL path is unchanged.
 
 No changes were made to the license, to the attribution of the original author, or to the
 non-commercial nature of the project.

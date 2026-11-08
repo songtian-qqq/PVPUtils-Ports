@@ -58,11 +58,14 @@ public final class SkijaRenderer {
     private static final java.util.List<java.util.function.Consumer<Canvas>> mainSubmitted = new java.util.ArrayList<>();
     private static boolean failed;
     private static boolean backdropBlurFailed;
+    private static final SkijaRasterCanvas RASTER = new SkijaRasterCanvas();
+    private static boolean rasterFailed;
 
     private SkijaRenderer() {
     }
 
     public static void renderOverlay(java.util.function.Consumer<Canvas> painter) {
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return;
         if (Minecraft.getInstance().getWindow().isMinimized()) return;
         boolean captureBackdrop = backdropRequested;
         backdropRequested = false;
@@ -74,7 +77,7 @@ public final class SkijaRenderer {
             draw(painter);
             return;
         }
-        if (failed) return;
+        if (failed || com.pvp_utils.client.compat.GpuApi.isVulkan()) return;
 
         Minecraft minecraft = Minecraft.getInstance();
         RenderTarget target = minecraft.gameRenderer.mainRenderTarget();
@@ -89,6 +92,7 @@ public final class SkijaRenderer {
 
     private static void paint(java.util.function.Consumer<Canvas> painter, boolean captureBackdrop) {
         if (failed) return;
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return;
         Window window = Minecraft.getInstance().getWindow();
         int width = window.getWidth();
         int height = window.getHeight();
@@ -107,6 +111,10 @@ public final class SkijaRenderer {
     float guiWidth, float guiHeight,
     java.util.function.Consumer<Canvas> painter,
     boolean captureBackdrop) {
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) {
+            paintRaster(guiWidth, guiHeight, painter);
+            return;
+        }
         GlState previous = GlState.capture();
         Image backdrop = null;
         try {
@@ -202,12 +210,77 @@ public final class SkijaRenderer {
     }
 
     public static void renderMainSubmitted() {
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return;
         if (mainSubmitted.isEmpty()) return;
         java.util.List<java.util.function.Consumer<Canvas>> painters = java.util.List.copyOf(mainSubmitted);
         mainSubmitted.clear();
         renderMainTarget(canvas -> {
             for (java.util.function.Consumer<Canvas> painter : painters) draw(painter);
         });
+    }
+
+    /**
+     * Vulkan 图形后端下的一帧合成：把本帧所有排队 painter（HUD、Skija 界面、ClickGUI 等）画到
+     * CPU 栅格画布，再作为一张纹理交给原版 GUI 管线贴在屏幕上。完全不碰 OpenGL。
+     *
+     * @return 是否真的画了东西
+     */
+    public static boolean renderVulkanFrame(net.minecraft.client.gui.GuiGraphicsExtractor graphics,
+            int guiWidth, int guiHeight) {
+        if (!com.pvp_utils.client.compat.GpuApi.isVulkan()) return false;
+        if (failed || rasterFailed) return false;
+        if (guiWidth <= 0 || guiHeight <= 0) return false;
+
+        SkijaFrameRenderer.drawFrameLayers();
+        java.util.List<java.util.function.Consumer<Canvas>> painters = new java.util.ArrayList<>(mainSubmitted);
+        mainSubmitted.clear();
+        submitted.clear();
+        if (painters.isEmpty()) return false;
+
+        Canvas canvas = RASTER.begin(guiWidth, guiHeight);
+        if (canvas == null) {
+            rasterFailed = true;
+            return false;
+        }
+        activeCanvas = canvas;
+        try {
+            for (java.util.function.Consumer<Canvas> painter : painters) draw(painter);
+        } catch (Throwable throwable) {
+            rasterFailed = true;
+            PVPUtils.LOGGER.error("Skija 栅格绘制失败，Vulkan 兼容模式下停用 Skija UI", throwable);
+            return false;
+        } finally {
+            activeCanvas = null;
+        }
+
+        if (!RASTER.flush()) {
+            rasterFailed = true;
+            return false;
+        }
+        Identifier texture = RASTER.textureId();
+        if (texture == null) return false;
+        graphics.blit(texture, 0, 0, guiWidth, guiHeight, 0f, 0f, 1f, 1f);
+        return true;
+    }
+
+    private static void paintRaster(float guiWidth, float guiHeight,
+            java.util.function.Consumer<Canvas> painter) {
+        if (failed || rasterFailed) return;
+        Canvas canvas = RASTER.begin(Math.round(guiWidth), Math.round(guiHeight));
+        if (canvas == null) {
+            rasterFailed = true;
+            return;
+        }
+        activeCanvas = canvas;
+        try {
+            painter.accept(canvas);
+        } catch (Throwable throwable) {
+            rasterFailed = true;
+            PVPUtils.LOGGER.error("Skija 栅格绘制失败，Vulkan 兼容模式下停用 Skija UI", throwable);
+        } finally {
+            activeCanvas = null;
+        }
+        RASTER.flush();
     }
 
     public static void renderSubmitted() {
@@ -277,6 +350,7 @@ public final class SkijaRenderer {
     }
 
     public static BorrowedImage borrowTexture(Identifier identifier) {
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return null;
         if (context == null || identifier == null) return null;
         BackendTexture backend = null;
         try {
@@ -307,6 +381,8 @@ public final class SkijaRenderer {
     }
 
     public static void close() {
+        RASTER.close();
+        SkijaUi.close();
         if (context == null) {
             return;
         }
@@ -318,13 +394,11 @@ public final class SkijaRenderer {
             themedFramebuffer = -1;
             themedColorTexture = -1;
         }
-        SkijaUi.close();
         context.close();
         context = null;
     }
 
-    private static void ensureSurface(int width, int height, int framebuffer, int samples, int stencilBits) {
-        if (context == null) context = DirectContext.makeGL();
+    private static void ensureSurface(int width, int height, int framebuffer, int samples, int stencilBits) {        if (context == null) context = DirectContext.makeGL();
         SurfaceTarget target = surfaces.get(framebuffer);
         if (target != null && (target.width() != width || target.height() != height
         || target.samples() != samples || target.stencilBits() != stencilBits)) {

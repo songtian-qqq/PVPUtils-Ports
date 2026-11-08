@@ -41,6 +41,7 @@
     "WindowMixin",
     "MinecraftAltAccessor",
     "GuiMixin",
+    "SkijaVulkanGuiMixin",
     "PlayerTabOverlayMixin",
     "ServerReconfigScreenMixin",
     "HotbarSmoothMixin",

@@ -106,6 +106,11 @@ public final class MainUIShader {
     }
 
     public void extractRenderState(GuiGraphicsExtractor graphics, double mouseX, double mouseY) {
+        // Vulkan 图形后端没有 GL 上下文，自定义 GLSL 背景着色器无法编译/绘制，直接走原版渐变兜底。
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) {
+            fallback(graphics);
+            return;
+        }
         ensureCompiled();
         if (failed || program == 0) {
             fallback(graphics);
@@ -264,6 +269,7 @@ public final class MainUIShader {
     }
 
     public void close() {
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return;
         if (program != 0) {
             GL20.glDeleteProgram(program);
             program = 0;

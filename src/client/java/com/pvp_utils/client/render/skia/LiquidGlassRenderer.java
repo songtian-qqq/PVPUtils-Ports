@@ -218,6 +218,9 @@ public final class LiquidGlassRenderer {
                                int tintColor, boolean shadow, boolean highlight, float highlightTaper, int slot,
                                SlotGrid grid) {
         if (width <= 0f || height <= 0f) return false;
+        // 液体玻璃依赖 "抓取当前 GL 帧缓冲 + Skija GL 后端"，Vulkan 后端下两个前提都不成立，
+        // 直接返回 false 让调用方回退到普通纯色/贴图面板。
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return false;
         if (client == null || client.getWindow() == null || client.gameRenderer.mainRenderTarget() == null) return false;
         int framebufferId = mainFramebufferId(client);
         if (framebufferId == 0 && !SkijaRenderer.isDrawing()) return false;

@@ -41,6 +41,7 @@ public final class GlassCaptureRenderer {
     }
 
     public Canvas beginFrame(int framebufferId) {
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return null;
         if (SkijaRenderer.isDrawing()) {
             SkijaRenderer.flush();
             framebufferId = SkijaRenderer.currentFramebuffer();
@@ -58,6 +59,7 @@ public final class GlassCaptureRenderer {
     }
 
     public Capture capture(Minecraft client, float x, float y, float width, float height, float margin) {
+        if (com.pvp_utils.client.compat.GpuApi.isVulkan()) return Capture.EMPTY;
         if (client == null || client.getWindow() == null) return Capture.EMPTY;
         ensureNativeLoaded();
         DirectContext context = framebufferBackend.ensureContext();
@@ -251,7 +253,9 @@ public final class GlassCaptureRenderer {
 
     public void destroy() {
         framebufferBackend.destroy();
-        if (captureFramebufferId != 0) glDeleteFramebuffers(captureFramebufferId);
+        if (captureFramebufferId != 0 && !com.pvp_utils.client.compat.GpuApi.isVulkan()) {
+            glDeleteFramebuffers(captureFramebufferId);
+        }
         captureFramebufferId = 0;
     }
 
