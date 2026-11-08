@@ -257,9 +257,11 @@ public final class SkijaRenderer {
             rasterFailed = true;
             return false;
         }
-        Identifier texture = RASTER.textureId();
+        net.minecraft.client.renderer.texture.DynamicTexture texture = RASTER.texture();
         if (texture == null) return false;
-        graphics.blit(texture, 0, 0, guiWidth, guiHeight, 0f, 0f, 1f, 1f);
+        graphics.blit(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED,
+                net.minecraft.resources.Identifier.fromNamespaceAndPath("pvp_utils", "skija_overlay"),
+                0, 0, 0f, 0f, guiWidth, guiHeight, guiWidth, guiHeight);
         return true;
     }
 

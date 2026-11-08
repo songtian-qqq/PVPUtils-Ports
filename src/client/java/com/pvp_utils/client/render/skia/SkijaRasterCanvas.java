@@ -79,13 +79,17 @@ final class SkijaRasterCanvas {
                 snapshot.close();
             }
             copyPixels(bitmap.readPixels());
-            RenderSystem.getDevice().createCommandEncoder().writeToTexture(texture.getTexture(), image);
+            texture.upload();
             return true;
         } catch (Throwable throwable) {
             failed = true;
             PVPUtils.LOGGER.error("Skija 栅格后端上传失败，Vulkan 兼容模式下停用 Skija UI", throwable);
             return false;
         }
+    }
+
+    net.minecraft.client.renderer.texture.DynamicTexture texture() {
+        return texture;
     }
 
     Identifier textureId() {
@@ -114,8 +118,8 @@ final class SkijaRasterCanvas {
             image.close();
             image = null;
         }
-        texture = new DynamicTexture("pvp_utils:skija_overlay", w, h, false);
         image = new NativeImage(NativeImage.Format.RGBA, w, h, false);
+        texture = new DynamicTexture(() -> "pvp_utils:skija_overlay", image);
         minecraft.getTextureManager().register(TEXTURE_ID, texture);
         registered = true;
     }
